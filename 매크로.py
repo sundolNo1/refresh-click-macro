@@ -60,6 +60,23 @@ def parse_seconds(text: str) -> float:
     return float(text)
 
 
+def align_grid(interval: float) -> float:
+    """주기를 '00초에 떨어지는 값'으로 보정한다.
+
+    새로고침이 매번 분의 00초(또는 그 약수 격자)에 오도록,
+    입력한 주기보다 절대 빨라지지 않는 선에서 가장 가까운 값을 고른다.
+      59.85 → 60.0    45 → 60.0    40 → 60.0
+      30    → 30.0    20 → 20.0    90 → 120.0
+    """
+    if interval <= 0:
+        return 60.0
+    if interval > 60.0:
+        # 1분 넘는 주기: 분 단위로 올림 (2분마다 00초, 3분마다 00초 …)
+        return math.ceil(interval / 60.0) * 60.0
+    # 1분 이하: 60을 나눠떨어지게 하는 격자 중 주기보다 같거나 큰 것
+    return 60.0 / math.floor(60.0 / interval)
+
+
 def fetch_ntp_offset(timeout: float = 3.0) -> float | None:
     """NTP 서버에서 정확한 시각을 받아 (표준시각 - 내컴퓨터시각) 오차(초)를 반환.
 
@@ -271,7 +288,7 @@ class MacroApp:
         self.sync_label.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 4), sticky="w")
         self.align_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frm_time, text="표준시각 정각에 맞춰 시작 (예: 주기 60초면 매분 00초에)",
+            frm_time, text="표준시각 매분 00초에 맞춰 시작 (첫 새로고침을 00초에)",
             variable=self.align_var,
         ).grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
 
@@ -569,9 +586,16 @@ class MacroApp:
         gap = 0.05  # 창 사이 최소 간격(초)
         next_run = time.perf_counter()
         next_target = 0.0
+        grid = interval
         if align:
-            # 다음 주기 경계(표준시각 기준)까지 대기 후 첫 새로고침
-            next_target = math.ceil(self.accurate_time() / interval) * interval
+            # 새로고침이 항상 00초에 떨어지도록, 주기를 '00초 격자'에 맞춰 보정한다.
+            # 입력한 주기보다 빨라지지 않도록 항상 같거나 느린 쪽으로 맞춘다.
+            #   59.85초 → 60초 (매분 00초)      45초 → 60초 (매분 00초)
+            #   30초    → 30초 (00초·30초)      90초 → 120초 (2분마다 00초)
+            grid = align_grid(interval)
+            if abs(grid - interval) > 1e-9:
+                self.log(f"정각 맞춤 — 주기를 {interval:.2f}초 → {grid:.2f}초 로 보정합니다.")
+            next_target = math.ceil(self.accurate_time() / grid) * grid
             delay = next_target - self.accurate_time()
             self.log(f"표준시각 {self._fmt_kst(next_target)} 에 첫 새로고침 예정 ({delay:.2f}초 대기)")
             if self._stop.wait(timeout=max(0.0, delay)):
@@ -603,13 +627,12 @@ class MacroApp:
                 self.log(f"[{self._count}] 창 {len(windows)}개 {mode} 완료")
 
                 if align:
-                    # 다음 주기 경계(표준시각)까지 대기
-                    next_target += interval
-                    delay = next_target - self.accurate_time()
-                    if delay < 0:
-                        # 밀렸으면 다음 경계로 건너뛴다
-                        next_target = math.ceil(self.accurate_time() / interval) * interval
-                        delay = next_target - self.accurate_time()
+                    # 다음 00초 격자까지 대기 (밀렸으면 그 다음 격자로 건너뛴다)
+                    next_target += grid
+                    now = self.accurate_time()
+                    if next_target < now:
+                        next_target = math.ceil(now / grid) * grid
+                    delay = next_target - now
                     if self._stop.wait(timeout=max(0.0, delay)):
                         break
                 else:
