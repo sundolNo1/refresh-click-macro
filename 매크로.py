@@ -65,9 +65,12 @@ class MacroApp:
         frm_set = ttk.LabelFrame(root, text="② 설정")
         frm_set.grid(row=1, column=0, sticky="ew", **pad)
 
-        ttk.Label(frm_set, text="몇 초마다 새로고침").grid(row=0, column=0, padx=10, pady=8, sticky="w")
-        self.interval_var = tk.StringVar(value="60")
-        ttk.Entry(frm_set, textvariable=self.interval_var, width=8).grid(row=0, column=1, sticky="w")
+        ttk.Label(frm_set, text="몇 초마다 새로고침 (0.01초 단위)").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+        self.interval_var = tk.StringVar(value="60.00")
+        ttk.Spinbox(
+            frm_set, from_=0.01, to=86400, increment=0.01, format="%.2f",
+            textvariable=self.interval_var, width=10,
+        ).grid(row=0, column=1, sticky="w")
         ttk.Label(frm_set, text="초").grid(row=0, column=2, sticky="w")
 
         ttk.Label(frm_set, text="새로고침 방식").grid(row=1, column=0, padx=10, pady=8, sticky="w")
@@ -77,10 +80,20 @@ class MacroApp:
             state="readonly", width=26,
         ).grid(row=1, column=1, columnspan=2, padx=(0, 10), sticky="w")
 
-        ttk.Label(frm_set, text="새로고침 후 클릭까지 대기").grid(row=2, column=0, padx=10, pady=8, sticky="w")
-        self.wait_var = tk.StringVar(value="2")
-        ttk.Entry(frm_set, textvariable=self.wait_var, width=8).grid(row=2, column=1, sticky="w")
+        ttk.Label(frm_set, text="새로고침 후 클릭까지 대기 (0.01초 단위)").grid(row=2, column=0, padx=10, pady=8, sticky="w")
+        self.wait_var = tk.StringVar(value="2.00")
+        ttk.Spinbox(
+            frm_set, from_=0.0, to=86400, increment=0.01, format="%.2f",
+            textvariable=self.wait_var, width=10,
+        ).grid(row=2, column=1, sticky="w")
         ttk.Label(frm_set, text="초").grid(row=2, column=2, sticky="w")
+
+        ttk.Label(frm_set, text="클릭 방식").grid(row=3, column=0, padx=10, pady=8, sticky="w")
+        self.click_mode_var = tk.StringVar(value="싱글 클릭")
+        ttk.Combobox(
+            frm_set, textvariable=self.click_mode_var, values=["싱글 클릭", "더블 클릭"],
+            state="readonly", width=12,
+        ).grid(row=3, column=1, columnspan=2, sticky="w")
 
         # 3. 시작 / 정지
         frm_run = ttk.Frame(root)
@@ -160,18 +173,22 @@ class MacroApp:
             return
 
         keys = KEY_CHOICES[self.key_var.get()]
+        clicks = 2 if self.click_mode_var.get() == "더블 클릭" else 1
         self._stop.clear()
         self._count = 0
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.log(f"시작 — {interval}초마다 새로고침 후 ({self.click_x}, {self.click_y}) 클릭")
+        self.log(
+            f"시작 — {interval:.2f}초마다 새로고침 후 "
+            f"({self.click_x}, {self.click_y}) {self.click_mode_var.get()}"
+        )
 
         self._worker = threading.Thread(
-            target=self._loop, args=(interval, wait, keys), daemon=True
+            target=self._loop, args=(interval, wait, keys, clicks), daemon=True
         )
         self._worker.start()
 
-    def _loop(self, interval: float, wait: float, keys: list[str]) -> None:
+    def _loop(self, interval: float, wait: float, keys: list[str], clicks: int) -> None:
         """새로고침 → 대기 → 클릭 반복 (드리프트 방지 스케줄링)."""
         key_label = "+".join(keys)
         next_run = time.perf_counter()
@@ -186,8 +203,9 @@ class MacroApp:
 
                 if self._stop.wait(timeout=wait):
                     break
-                pyautogui.click(x=self.click_x, y=self.click_y)
-                self.log(f"[{self._count}] 클릭 ({self.click_x}, {self.click_y})")
+                pyautogui.click(x=self.click_x, y=self.click_y, clicks=clicks, interval=0.05)
+                mode = "더블클릭" if clicks == 2 else "클릭"
+                self.log(f"[{self._count}] {mode} ({self.click_x}, {self.click_y})")
 
                 next_run += interval
                 sleep_for = next_run - time.perf_counter()
