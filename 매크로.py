@@ -5,11 +5,70 @@
 """
 from __future__ import annotations
 
+import math
 import platform
+import socket
+import struct
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
+
+# 한국 표준시(KST) = UTC + 9시간
+KST_OFFSET = 9 * 3600
+# NTP 시간 서버 목록 (앞에서부터 시도)
+NTP_SERVERS = ("time.google.com", "time.windows.com", "kr.pool.ntp.org", "pool.ntp.org")
+
+
+def parse_seconds(text: str) -> float:
+    """시간 입력을 초(float)로 변환한다.
+
+    콜론 형식은 '초:백분의일초' 로 해석한다.
+      - "59:85" → 59.85초
+      - "0:05"  → 0.05초
+    콜론이 없으면 일반 숫자로 본다. ("59.85", "60")
+    """
+    text = text.strip()
+    if ":" in text:
+        left, right = text.split(":", 1)
+        whole = int(left.strip() or "0")
+        # 콜론 뒤는 백분의 일초(2자리) 로 취급: "85"→0.85, "05"→0.05
+        frac = int(right.strip() or "0") / 100.0
+        if whole < 0 or frac < 0:
+            raise ValueError
+        return whole + frac
+    return float(text)
+
+
+def fetch_ntp_offset(timeout: float = 3.0) -> float | None:
+    """NTP 서버에서 정확한 시각을 받아 (표준시각 - 내컴퓨터시각) 오차(초)를 반환.
+
+    성공 시 오차(초, 양수면 내 시계가 느림), 실패 시 None.
+    표준 라이브러리만 사용한다.
+    """
+    ntp_delta = 2208988800  # 1900-01-01 → 1970-01-01 초 차이
+    packet = b"\x1b" + 47 * b"\0"
+    for host in NTP_SERVERS:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            t0 = time.time()
+            sock.sendto(packet, (host, 123))
+            data, _ = sock.recvfrom(48)
+            t3 = time.time()
+            secs = struct.unpack("!I", data[40:44])[0] - ntp_delta
+            frac = struct.unpack("!I", data[44:48])[0] / 2 ** 32
+            server_time = secs + frac
+            # 왕복 지연의 절반을 보정
+            offset = server_time + (t3 - t0) / 2 - t3
+            return offset
+        except Exception:
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+    return None
 
 try:
     import pyautogui
@@ -35,37 +94,44 @@ class MacroApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.click_x: int | None = None
-        self.click_y: int | None = None
+        # 각 창: (선택용 좌표, 클릭할 버튼 좌표)
+        self.windows: list[tuple[tuple[int, int], tuple[int, int]]] = []
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._count = 0
+        self.time_offset = 0.0   # 표준시각 - 내컴퓨터시각 (초)
+        self.synced = False
 
         root.title("자동 새로고침 · 클릭 매크로")
         root.resizable(False, False)
 
         pad = {"padx": 14, "pady": 6}
-        big_font = ("", 13)
 
-        # 1. 클릭 위치
-        frm_pos = ttk.LabelFrame(root, text="① 클릭할 위치")
+        # 1. 클릭할 창 목록 (창마다 선택용 + 클릭용 좌표 2개)
+        frm_pos = ttk.LabelFrame(root, text="① 클릭할 창 목록 (여러 창 동시 처리)")
         frm_pos.grid(row=0, column=0, sticky="ew", **pad)
-        self.pos_label = ttk.Label(frm_pos, text="아직 지정 안 됨", font=big_font, foreground="#c0392b")
-        self.pos_label.grid(row=0, column=0, padx=10, pady=8, sticky="w")
-        ttk.Button(frm_pos, text="이 위치로 지정하기", command=self.capture_position).grid(
-            row=0, column=1, padx=10, pady=8
+        self.win_list = tk.Listbox(frm_pos, height=4, width=44)
+        self.win_list.grid(row=0, column=0, rowspan=3, padx=(10, 6), pady=8)
+        self.add_btn = ttk.Button(frm_pos, text="＋ 창 추가", command=self.capture_window)
+        self.add_btn.grid(row=0, column=1, padx=6, pady=(8, 2), sticky="ew")
+        ttk.Button(frm_pos, text="마지막 삭제", command=self.remove_last_window).grid(
+            row=1, column=1, padx=6, pady=2, sticky="ew"
         )
-        ttk.Label(
+        ttk.Button(frm_pos, text="모두 지우기", command=self.clear_windows).grid(
+            row=2, column=1, padx=6, pady=2, sticky="ew"
+        )
+        self.capture_hint = ttk.Label(
             frm_pos,
-            text="버튼을 누르고 3초 안에 마우스를 클릭할 곳에 올려두세요.",
-            foreground="#555",
-        ).grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
+            text="＋창 추가 → ①선택용 빈 곳 → ②클릭할 버튼 순으로 각각 3초 안에 마우스를 올려두세요.",
+            foreground="#555", wraplength=420, justify="left",
+        )
+        self.capture_hint.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
 
         # 2. 설정
         frm_set = ttk.LabelFrame(root, text="② 설정")
         frm_set.grid(row=1, column=0, sticky="ew", **pad)
 
-        ttk.Label(frm_set, text="몇 초마다 새로고침 (0.01초 단위)").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+        ttk.Label(frm_set, text="몇 초마다 새로고침  (예: 59:85 = 59.85초)").grid(row=0, column=0, padx=10, pady=8, sticky="w")
         self.interval_var = tk.StringVar(value="60.00")
         ttk.Spinbox(
             frm_set, from_=0.01, to=86400, increment=0.01, format="%.2f",
@@ -80,7 +146,7 @@ class MacroApp:
             state="readonly", width=26,
         ).grid(row=1, column=1, columnspan=2, padx=(0, 10), sticky="w")
 
-        ttk.Label(frm_set, text="새로고침 후 클릭까지 대기 (0.01초 단위)").grid(row=2, column=0, padx=10, pady=8, sticky="w")
+        ttk.Label(frm_set, text="새로고침 후 클릭까지 대기  (예: 0:05 = 0.05초)").grid(row=2, column=0, padx=10, pady=8, sticky="w")
         self.wait_var = tk.StringVar(value="2.00")
         ttk.Spinbox(
             frm_set, from_=0.0, to=86400, increment=0.01, format="%.2f",
@@ -95,9 +161,25 @@ class MacroApp:
             state="readonly", width=12,
         ).grid(row=3, column=1, columnspan=2, sticky="w")
 
-        # 3. 시작 / 정지
+        # 3. 인터넷 표준시각(KST) 동기화
+        frm_time = ttk.LabelFrame(root, text="③ 인터넷 표준시각 (KST)")
+        frm_time.grid(row=2, column=0, sticky="ew", **pad)
+        self.clock_label = ttk.Label(frm_time, text="현재 시각 --:--:--", font=("", 14))
+        self.clock_label.grid(row=0, column=0, padx=10, pady=(8, 2), sticky="w")
+        ttk.Button(frm_time, text="표준시각 동기화", command=self.sync_time).grid(
+            row=0, column=1, padx=10, pady=8
+        )
+        self.sync_label = ttk.Label(frm_time, text="동기화 안 됨 (내 컴퓨터 시계 사용)", foreground="#c0392b")
+        self.sync_label.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 4), sticky="w")
+        self.align_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_time, text="표준시각 정각에 맞춰 시작 (예: 주기 60초면 매분 00초에)",
+            variable=self.align_var,
+        ).grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
+
+        # 4. 시작 / 정지
         frm_run = ttk.Frame(root)
-        frm_run.grid(row=2, column=0, sticky="ew", **pad)
+        frm_run.grid(row=3, column=0, sticky="ew", **pad)
         self.start_btn = tk.Button(
             frm_run, text="▶ 시작", font=("", 15, "bold"), bg="#27ae60", fg="white",
             activebackground="#219150", width=10, command=self.start,
@@ -109,13 +191,13 @@ class MacroApp:
         )
         self.stop_btn.grid(row=0, column=1, padx=6, ipady=6)
 
-        # 4. 상태
+        # 5. 상태
         self.status = tk.Text(root, height=8, width=46, state="disabled", bg="#1e1e1e", fg="#dcdcdc")
-        self.status.grid(row=3, column=0, padx=14, pady=(4, 4))
+        self.status.grid(row=4, column=0, padx=14, pady=(4, 4))
         ttk.Label(
             root, text="정지: [정지] 버튼 · 또는 마우스를 화면 맨 왼쪽 위 모서리로",
             foreground="#555",
-        ).grid(row=4, column=0, pady=(0, 10))
+        ).grid(row=5, column=0, pady=(0, 10))
 
         if not _PYAUTO_OK:
             self.log("⚠ pyautogui 가 설치되지 않아 동작할 수 없습니다.")
@@ -126,94 +208,221 @@ class MacroApp:
             self.log("  '손쉬운 사용' 에 이 앱(또는 터미널)을 허용해야 합니다.")
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._tick()  # 실시간 시계 시작
+
+    # ---------- 표준시각 ----------
+    def accurate_time(self) -> float:
+        """표준시각 기준의 현재 유닉스 시각(초). 동기화 안 됐으면 내 컴퓨터 시각."""
+        return time.time() + self.time_offset
+
+    def _fmt_kst(self, unix_time: float) -> str:
+        """유닉스 시각을 KST 시:분:초.백분의일 문자열로."""
+        kst = time.gmtime(unix_time + KST_OFFSET)
+        hundredths = int((unix_time % 1) * 100)
+        return time.strftime("%H:%M:%S", kst) + f".{hundredths:02d}"
+
+    def _tick(self) -> None:
+        """0.05초마다 현재 표준시각을 화면에 갱신한다."""
+        self.clock_label.config(text=f"현재 시각 {self._fmt_kst(self.accurate_time())}")
+        self.root.after(50, self._tick)
+
+    def sync_time(self) -> None:
+        """NTP 서버에서 표준시각을 받아 오차를 보정한다. (백그라운드 스레드)"""
+        self.sync_label.config(text="동기화 중… 잠시만요", foreground="#e67e22")
+
+        def worker() -> None:
+            offset = fetch_ntp_offset()
+
+            def apply() -> None:
+                if offset is None:
+                    self.synced = False
+                    self.sync_label.config(
+                        text="동기화 실패 (인터넷 확인) — 내 컴퓨터 시계 사용", foreground="#c0392b"
+                    )
+                    self.log("표준시각 동기화 실패 — 인터넷 연결을 확인하세요.")
+                else:
+                    self.time_offset = offset
+                    self.synced = True
+                    self.sync_label.config(
+                        text=f"동기화 완료 · 내 시계와 오차 {offset:+.3f}초", foreground="#27ae60"
+                    )
+                    self.log(f"표준시각 동기화 완료 (오차 {offset:+.3f}초)")
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- 유틸 ----------
     def log(self, msg: str) -> None:
         """상태 창에 한 줄 기록한다. (스레드에서 호출 안전)"""
         def _append() -> None:
+            stamp = self._fmt_kst(self.accurate_time())
             self.status.config(state="normal")
-            self.status.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
+            self.status.insert("end", f"{stamp}  {msg}\n")
             self.status.see("end")
             self.status.config(state="disabled")
         self.root.after(0, _append)
 
-    # ---------- 좌표 캡처 ----------
-    def capture_position(self) -> None:
-        """3초 카운트다운 후 현재 마우스 위치를 클릭 좌표로 저장한다."""
+    # ---------- 창 좌표 캡처 ----------
+    def _refresh_win_list(self) -> None:
+        """목록 상자를 현재 창 목록으로 다시 그린다."""
+        self.win_list.delete(0, "end")
+        for i, (focus, target) in enumerate(self.windows, 1):
+            self.win_list.insert(
+                "end", f"{i}번 창  선택{focus} → 클릭{target}"
+            )
+
+    def capture_window(self) -> None:
+        """3초씩 두 번 카운트다운하며 [선택용]→[클릭용] 좌표를 캡처해 창 하나를 추가한다."""
         if not _PYAUTO_OK:
             return
+        self.add_btn.config(state="disabled")
         self.start_btn.config(state="disabled")
+        captured: list[tuple[int, int]] = []
+        steps = [
+            ("① 선택용 빈 곳", "#e67e22"),
+            ("② 클릭할 버튼", "#2980b9"),
+        ]
 
-        def countdown(n: int) -> None:
+        def do_step(step: int, n: int) -> None:
+            name, color = steps[step]
             if n > 0:
-                self.pos_label.config(text=f"{n}초 후 현재 마우스 위치 저장…", foreground="#e67e22")
-                self.root.after(1000, countdown, n - 1)
+                self.capture_hint.config(text=f"{name} 위에 마우스를 올리세요…  {n}", foreground=color)
+                self.root.after(1000, do_step, step, n - 1)
+                return
+            x, y = pyautogui.position()
+            captured.append((int(x), int(y)))
+            self.log(f"{name} 좌표: ({x}, {y})")
+            if step + 1 < len(steps):
+                self.root.after(300, do_step, step + 1, 3)
             else:
-                x, y = pyautogui.position()
-                self.click_x, self.click_y = int(x), int(y)
-                self.pos_label.config(text=f"지정됨:  X={x}, Y={y}", foreground="#27ae60")
-                self.log(f"클릭 위치 지정: ({x}, {y})")
+                self.windows.append((captured[0], captured[1]))
+                self._refresh_win_list()
+                self.capture_hint.config(
+                    text=f"{len(self.windows)}번 창 추가됨! 다른 창도 ＋창 추가로 등록하세요.",
+                    foreground="#27ae60",
+                )
+                self.add_btn.config(state="normal")
                 self.start_btn.config(state="normal")
 
-        countdown(3)
+        do_step(0, 3)
+
+    def remove_last_window(self) -> None:
+        """마지막으로 추가한 창을 목록에서 뺀다."""
+        if self.windows:
+            self.windows.pop()
+            self._refresh_win_list()
+            self.log("마지막 창 삭제")
+
+    def clear_windows(self) -> None:
+        """창 목록을 모두 비운다."""
+        self.windows.clear()
+        self._refresh_win_list()
+        self.log("창 목록 모두 지움")
 
     # ---------- 실행 ----------
     def start(self) -> None:
         """입력값을 검증하고 매크로 스레드를 시작한다."""
-        if self.click_x is None:
-            messagebox.showwarning("확인", "먼저 ① 에서 클릭할 위치를 지정하세요.")
+        if not self.windows:
+            messagebox.showwarning("확인", "먼저 ① 에서 ＋창 추가로 창을 1개 이상 등록하세요.")
             return
         try:
-            interval = float(self.interval_var.get())
-            wait = float(self.wait_var.get())
+            interval = parse_seconds(self.interval_var.get())
+            wait = parse_seconds(self.wait_var.get())
             if interval <= 0 or wait < 0:
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("확인", "주기와 대기 시간은 0보다 큰 숫자로 입력하세요.")
+            messagebox.showwarning(
+                "확인",
+                "시간을 올바르게 입력하세요.\n"
+                "예) 59.85  또는  59:85 (= 59.85초)\n"
+                "     0.05   또는  0:05  (= 0.05초)",
+            )
             return
 
         keys = KEY_CHOICES[self.key_var.get()]
         clicks = 2 if self.click_mode_var.get() == "더블 클릭" else 1
+        align = self.align_var.get()
         self._stop.clear()
         self._count = 0
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        windows = list(self.windows)  # 실행 중 목록 변경 대비 복사
         self.log(
-            f"시작 — {interval:.2f}초마다 새로고침 후 "
-            f"({self.click_x}, {self.click_y}) {self.click_mode_var.get()}"
+            f"시작 — 창 {len(windows)}개, {interval:.2f}초마다 새로고침 후 "
+            f"{self.click_mode_var.get()}"
         )
+        if align and not self.synced:
+            self.log("참고: 표준시각 미동기화 — 내 컴퓨터 시계 기준으로 정각 정렬합니다.")
 
         self._worker = threading.Thread(
-            target=self._loop, args=(interval, wait, keys, clicks), daemon=True
+            target=self._loop, args=(interval, wait, keys, clicks, align, windows), daemon=True
         )
         self._worker.start()
 
-    def _loop(self, interval: float, wait: float, keys: list[str], clicks: int) -> None:
-        """새로고침 → 대기 → 클릭 반복 (드리프트 방지 스케줄링)."""
+    def _loop(
+        self, interval: float, wait: float, keys: list[str], clicks: int, align: bool,
+        windows: list[tuple[tuple[int, int], tuple[int, int]]],
+    ) -> None:
+        """여러 창을 [모두 새로고침] → 대기 → [모두 클릭] 반복 (드리프트 방지 스케줄링).
+
+        각 창은 '선택용 좌표'를 눌러 활성화한 뒤 새로고침하고,
+        대기 후 '클릭용 좌표'를 누른다. align=True 면 표준시각 정각에 맞춘다.
+        """
         key_label = "+".join(keys)
+        gap = 0.05  # 창 사이 최소 간격(초)
         next_run = time.perf_counter()
+        next_target = 0.0
+        if align:
+            # 다음 주기 경계(표준시각 기준)까지 대기 후 첫 새로고침
+            next_target = math.ceil(self.accurate_time() / interval) * interval
+            delay = next_target - self.accurate_time()
+            self.log(f"표준시각 {self._fmt_kst(next_target)} 에 첫 새로고침 예정 ({delay:.2f}초 대기)")
+            if self._stop.wait(timeout=max(0.0, delay)):
+                self.root.after(0, self._reset_buttons)
+                return
         try:
             while not self._stop.is_set():
                 self._count += 1
-                if len(keys) == 1:
-                    pyautogui.press(keys[0])
-                else:
-                    pyautogui.hotkey(*keys)
-                self.log(f"[{self._count}] 새로고침({key_label})")
+
+                # 새로고침 라운드: 각 창을 선택 → 새로고침 (빠르게 연속)
+                for focus, _target in windows:
+                    pyautogui.click(x=focus[0], y=focus[1])   # 빈 곳 눌러 창 활성화
+                    time.sleep(gap)
+                    if len(keys) == 1:
+                        pyautogui.press(keys[0])
+                    else:
+                        pyautogui.hotkey(*keys)
+                    time.sleep(gap)
+                self.log(f"[{self._count}] 창 {len(windows)}개 새로고침({key_label})")
 
                 if self._stop.wait(timeout=wait):
                     break
-                pyautogui.click(x=self.click_x, y=self.click_y, clicks=clicks, interval=0.05)
-                mode = "더블클릭" if clicks == 2 else "클릭"
-                self.log(f"[{self._count}] {mode} ({self.click_x}, {self.click_y})")
 
-                next_run += interval
-                sleep_for = next_run - time.perf_counter()
-                if sleep_for < 0:
-                    next_run = time.perf_counter()
-                    continue
-                if self._stop.wait(timeout=sleep_for):
-                    break
+                # 클릭 라운드: 각 창의 버튼 클릭 (빠르게 연속)
+                mode = "더블클릭" if clicks == 2 else "클릭"
+                for _focus, target in windows:
+                    pyautogui.click(x=target[0], y=target[1], clicks=clicks, interval=0.05)
+                    time.sleep(gap)
+                self.log(f"[{self._count}] 창 {len(windows)}개 {mode} 완료")
+
+                if align:
+                    # 다음 주기 경계(표준시각)까지 대기
+                    next_target += interval
+                    delay = next_target - self.accurate_time()
+                    if delay < 0:
+                        # 밀렸으면 다음 경계로 건너뛴다
+                        next_target = math.ceil(self.accurate_time() / interval) * interval
+                        delay = next_target - self.accurate_time()
+                    if self._stop.wait(timeout=max(0.0, delay)):
+                        break
+                else:
+                    next_run += interval
+                    sleep_for = next_run - time.perf_counter()
+                    if sleep_for < 0:
+                        next_run = time.perf_counter()
+                        continue
+                    if self._stop.wait(timeout=sleep_for):
+                        break
         except pyautogui.FailSafeException:
             self.log("마우스 모서리 감지 — 정지합니다.")
         except Exception as exc:  # noqa: BLE001
