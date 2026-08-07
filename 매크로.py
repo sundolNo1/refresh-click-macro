@@ -6,13 +6,18 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
+import hmac
+import json
 import math
+import os
 import platform
 import socket
 import struct
 import threading
 import time
 import tkinter as tk
+import urllib.request
 from tkinter import messagebox, ttk
 
 # 한국 표준시(KST) = UTC + 9시간
@@ -24,6 +29,15 @@ EXPIRY_TEXT = "2026-08-22 00:00"
 EXPIRY_UNIX = calendar.timegm((2026, 8, 22, 0, 0, 0)) - KST_OFFSET
 # NTP 시간 서버 목록 (앞에서부터 시도)
 NTP_SERVERS = ("time.google.com", "time.windows.com", "kr.pool.ntp.org", "pool.ntp.org")
+# NTP(UDP 123)가 막힌 환경을 위한 예비 수단: HTTPS 응답의 Date 헤더
+HTTP_TIME_URLS = ("https://www.google.com/generate_204", "https://www.cloudflare.com/")
+
+# 사용 기록 파일 — 시계 되돌리기를 막기 위해 '지금까지 본 가장 늦은 시각'을 저장한다.
+STATE_KEY = b"refresh-click-macro/v1/state"
+STATE_DIRNAME = ".rcmacro"
+STATE_FILENAME = "state.dat"
+# 저장된 시각보다 이만큼 넘게 과거로 돌아가면 시계 조작으로 본다.
+ROLLBACK_TOLERANCE = 300.0  # 초
 
 
 def parse_seconds(text: str) -> float:
@@ -75,6 +89,83 @@ def fetch_ntp_offset(timeout: float = 3.0) -> float | None:
             if sock is not None:
                 sock.close()
     return None
+
+
+def fetch_http_offset(timeout: float = 4.0) -> float | None:
+    """HTTPS 응답의 Date 헤더로 표준시각 오차(초)를 구한다. NTP가 막혔을 때의 예비 수단.
+
+    초 단위까지만 정확하지만, 만료 판정(날짜 단위)에는 충분하다.
+    """
+    import email.utils
+
+    for url in HTTP_TIME_URLS:
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                date_header = resp.headers.get("Date")
+            t3 = time.time()
+            if not date_header:
+                continue
+            server_time = email.utils.parsedate_to_datetime(date_header).timestamp()
+            return server_time + (t3 - t0) / 2 - t3
+        except Exception:
+            continue
+    return None
+
+
+def fetch_trusted_offset() -> float | None:
+    """인터넷에서 표준시각 오차를 구한다. NTP 먼저, 실패하면 HTTPS Date.
+
+    둘 다 실패하면 None — 이때는 '시각을 확인할 수 없음'으로 보고 실행을 막는다.
+    """
+    offset = fetch_ntp_offset()
+    if offset is None:
+        offset = fetch_http_offset()
+    return offset
+
+
+# ---------- 사용 기록(시계 되돌리기 방지) ----------
+def _state_path() -> str:
+    """사용 기록 파일 경로. 윈도우는 LOCALAPPDATA, 그 외는 홈 디렉터리."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, STATE_DIRNAME, STATE_FILENAME)
+
+
+def _sign(payload: str) -> str:
+    """기록 파일 위조를 걸러내기 위한 서명."""
+    return hmac.new(STATE_KEY, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def load_state() -> dict:
+    """저장된 사용 기록을 읽는다.
+
+    없으면 빈 기록, 손상/위조되었으면 {"tampered": True} 를 돌려준다.
+    """
+    try:
+        with open(_state_path(), "r", encoding="utf-8") as fp:
+            raw = json.load(fp)
+        payload, sig = raw["payload"], raw["sig"]
+        if not hmac.compare_digest(_sign(payload), sig):
+            return {"tampered": True}
+        return json.loads(payload)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {"tampered": True}
+
+
+def save_state(state: dict) -> None:
+    """사용 기록을 서명과 함께 저장한다. 실패해도 프로그램은 계속 돈다."""
+    try:
+        path = _state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = json.dumps(state, sort_keys=True)
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump({"payload": payload, "sig": _sign(payload)}, fp)
+    except Exception:
+        pass
+
 
 try:
     import pyautogui
@@ -176,7 +267,7 @@ class MacroApp:
         ttk.Button(frm_time, text="표준시각 동기화", command=self.sync_time).grid(
             row=0, column=1, padx=10, pady=8
         )
-        self.sync_label = ttk.Label(frm_time, text="동기화 안 됨 (내 컴퓨터 시계 사용)", foreground="#c0392b")
+        self.sync_label = ttk.Label(frm_time, text="동기화 안 됨 (인터넷 연결 필요)", foreground="#c0392b")
         self.sync_label.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 4), sticky="w")
         self.align_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -221,46 +312,88 @@ class MacroApp:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._tick()  # 실시간 시계 시작
         self._startup_expiry_check()  # 사용 기한 확인 (인터넷 시간 기준)
+        self._schedule_recheck()  # 켜 둔 채로 만료일이 지나가는 경우 대비
 
     # ---------- 사용 기한 ----------
     def _startup_expiry_check(self) -> None:
-        """시작 시 인터넷 표준시각으로 만료 여부를 확인한다. (실패하면 컴퓨터 시계)"""
-        self.start_btn.config(state="disabled")
+        """시작 시 인터넷 표준시각을 받아 만료 여부를 확인한다.
 
+        인터넷으로 시각을 확인하지 못하면 실행을 막는다. (컴퓨터 시계는 믿지 않는다)
+        """
+        self.start_btn.config(state="disabled")
+        self._verify_expiry_async(first_run=True)
+
+    def _verify_expiry_async(self, first_run: bool = False) -> None:
+        """백그라운드에서 인터넷 표준시각을 다시 받아 만료 여부를 재확인한다."""
         def worker() -> None:
-            offset = fetch_ntp_offset()
+            offset = fetch_trusted_offset()
 
             def apply() -> None:
-                if offset is not None:
-                    self.time_offset = offset
-                    self.synced = True
-                    src = "인터넷 표준시각"
-                else:
-                    src = "컴퓨터 시계(인터넷 안 됨)"
-                self._evaluate_expiry(src)
+                if offset is None:
+                    self.synced = False
+                    self._block("인터넷 연결이 필요합니다 (시각 확인 실패)")
+                    if first_run:
+                        self.log("인터넷으로 현재 시각을 확인하지 못했습니다.")
+                        self.log("  연결을 확인한 뒤 [표준시각 동기화] 를 눌러주세요.")
+                    return
+                self.time_offset = offset
+                self.synced = True
+                self._evaluate_expiry()
             self.root.after(0, apply)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _evaluate_expiry(self, source: str) -> None:
-        """현재 시각과 만료일을 비교해 만료 상태와 화면을 갱신한다."""
+    def _schedule_recheck(self) -> None:
+        """10분마다 만료 여부를 다시 확인한다. (오래 켜 두는 경우 대비)"""
+        def again() -> None:
+            self._verify_expiry_async()
+            self.root.after(600_000, again)
+        self.root.after(600_000, again)
+
+    def _block(self, reason: str) -> None:
+        """실행을 막고, 돌고 있으면 정지시킨 뒤 사유를 화면에 표시한다."""
+        self._expired = True
+        self.start_btn.config(state="disabled")
+        self.expiry_label.config(text=reason, foreground="#c0392b")
+        if not self._stop.is_set():
+            self._stop.set()
+
+    def _evaluate_expiry(self) -> None:
+        """확인된 표준시각으로 만료 여부를 판정하고 화면을 갱신한다."""
+        if not self.synced:
+            self._block("인터넷 연결이 필요합니다 (시각 확인 실패)")
+            return
+
+        state = load_state()
+        if state.get("tampered") or state.get("expired"):
+            self._block(f"사용할 수 없습니다 (만료일 {EXPIRY_TEXT} KST)")
+            self.log("사용 기록이 만료 상태이거나 손상되었습니다.")
+            return
+
         now = self.accurate_time()
+        max_seen = state.get("max_seen", 0.0)
+        if now < max_seen - ROLLBACK_TOLERANCE:
+            # 이전에 확인했던 시각보다 과거 → 시계/시간서버 조작으로 본다.
+            save_state({"max_seen": max_seen, "expired": True})
+            self._block("시각이 비정상입니다 — 사용할 수 없습니다")
+            self.log("이전 실행보다 시각이 과거로 되돌아갔습니다. 사용이 중지됩니다.")
+            return
+
         if now >= EXPIRY_UNIX:
-            self._expired = True
-            self.start_btn.config(state="disabled")
-            self.expiry_label.config(
-                text=f"사용 기간이 만료되었습니다 (만료일 {EXPIRY_TEXT} KST)", foreground="#c0392b"
-            )
-            self.log(f"사용 기간 만료됨 — {source} 기준. (만료일 {EXPIRY_TEXT})")
-        else:
-            self._expired = False
-            days_left = (EXPIRY_UNIX - now) / 86400
-            self.expiry_label.config(
-                text=f"사용 가능 기간: ~{EXPIRY_TEXT} (KST) · 약 {days_left:.1f}일 남음",
-                foreground="#888",
-            )
-            if _PYAUTO_OK:
-                self.start_btn.config(state="normal")
+            save_state({"max_seen": max(now, max_seen), "expired": True})
+            self._block(f"사용 기간이 만료되었습니다 (만료일 {EXPIRY_TEXT} KST)")
+            self.log(f"사용 기간 만료됨 — 인터넷 표준시각 기준. (만료일 {EXPIRY_TEXT})")
+            return
+
+        save_state({"max_seen": max(now, max_seen), "expired": False})
+        self._expired = False
+        days_left = (EXPIRY_UNIX - now) / 86400
+        self.expiry_label.config(
+            text=f"사용 가능 기간: ~{EXPIRY_TEXT} (KST) · 약 {days_left:.1f}일 남음",
+            foreground="#888",
+        )
+        if _PYAUTO_OK:
+            self.start_btn.config(state="normal")
 
     # ---------- 표준시각 ----------
     def accurate_time(self) -> float:
@@ -283,15 +416,16 @@ class MacroApp:
         self.sync_label.config(text="동기화 중… 잠시만요", foreground="#e67e22")
 
         def worker() -> None:
-            offset = fetch_ntp_offset()
+            offset = fetch_trusted_offset()
 
             def apply() -> None:
                 if offset is None:
                     self.synced = False
                     self.sync_label.config(
-                        text="동기화 실패 (인터넷 확인) — 내 컴퓨터 시계 사용", foreground="#c0392b"
+                        text="동기화 실패 — 인터넷 연결을 확인하세요", foreground="#c0392b"
                     )
                     self.log("표준시각 동기화 실패 — 인터넷 연결을 확인하세요.")
+                    self._block("인터넷 연결이 필요합니다 (시각 확인 실패)")
                 else:
                     self.time_offset = offset
                     self.synced = True
@@ -299,6 +433,7 @@ class MacroApp:
                         text=f"동기화 완료 · 내 시계와 오차 {offset:+.3f}초", foreground="#27ae60"
                     )
                     self.log(f"표준시각 동기화 완료 (오차 {offset:+.3f}초)")
+                    self._evaluate_expiry()
             self.root.after(0, apply)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -374,8 +509,16 @@ class MacroApp:
     # ---------- 실행 ----------
     def start(self) -> None:
         """입력값을 검증하고 매크로 스레드를 시작한다."""
-        # 실행 순간에도 만료를 한 번 더 확인 (인터넷 시간 기준)
-        self._evaluate_expiry("인터넷 표준시각" if self.synced else "컴퓨터 시계")
+        # 실행 순간에도 만료를 한 번 더 확인 (반드시 인터넷 표준시각 기준)
+        if not self.synced:
+            messagebox.showwarning(
+                "인터넷 연결 필요",
+                "현재 시각을 인터넷으로 확인해야 실행할 수 있습니다.\n"
+                "연결을 확인한 뒤 [표준시각 동기화] 를 눌러주세요.",
+            )
+            self._verify_expiry_async()
+            return
+        self._evaluate_expiry()
         if self._expired:
             messagebox.showwarning("사용 기간 만료", f"사용 기간이 만료되었습니다.\n만료일: {EXPIRY_TEXT} (KST)")
             return
@@ -408,9 +551,6 @@ class MacroApp:
             f"시작 — 창 {len(windows)}개, {interval:.2f}초마다 새로고침 후 "
             f"{self.click_mode_var.get()}"
         )
-        if align and not self.synced:
-            self.log("참고: 표준시각 미동기화 — 내 컴퓨터 시계 기준으로 정각 정렬합니다.")
-
         self._worker = threading.Thread(
             target=self._loop, args=(interval, wait, keys, clicks, align, windows), daemon=True
         )
