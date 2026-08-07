@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import math
 import platform
 import socket
@@ -16,6 +17,11 @@ from tkinter import messagebox, ttk
 
 # 한국 표준시(KST) = UTC + 9시간
 KST_OFFSET = 9 * 3600
+
+# ===== 사용 기한 =====
+# 2026년 8월 22일 00시 00분 (KST) 이 되면 만료.
+EXPIRY_TEXT = "2026-08-22 00:00"
+EXPIRY_UNIX = calendar.timegm((2026, 8, 22, 0, 0, 0)) - KST_OFFSET
 # NTP 시간 서버 목록 (앞에서부터 시도)
 NTP_SERVERS = ("time.google.com", "time.windows.com", "kr.pool.ntp.org", "pool.ntp.org")
 
@@ -101,6 +107,7 @@ class MacroApp:
         self._count = 0
         self.time_offset = 0.0   # 표준시각 - 내컴퓨터시각 (초)
         self.synced = False
+        self._expired = False
 
         root.title("자동 새로고침 · 클릭 매크로")
         root.resizable(False, False)
@@ -197,7 +204,11 @@ class MacroApp:
         ttk.Label(
             root, text="정지: [정지] 버튼 · 또는 마우스를 화면 맨 왼쪽 위 모서리로",
             foreground="#555",
-        ).grid(row=5, column=0, pady=(0, 10))
+        ).grid(row=5, column=0, pady=(0, 4))
+        self.expiry_label = ttk.Label(
+            root, text=f"사용 가능 기간: ~{EXPIRY_TEXT} (KST) · 기간 확인 중…", foreground="#888"
+        )
+        self.expiry_label.grid(row=6, column=0, pady=(0, 10))
 
         if not _PYAUTO_OK:
             self.log("⚠ pyautogui 가 설치되지 않아 동작할 수 없습니다.")
@@ -209,6 +220,47 @@ class MacroApp:
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._tick()  # 실시간 시계 시작
+        self._startup_expiry_check()  # 사용 기한 확인 (인터넷 시간 기준)
+
+    # ---------- 사용 기한 ----------
+    def _startup_expiry_check(self) -> None:
+        """시작 시 인터넷 표준시각으로 만료 여부를 확인한다. (실패하면 컴퓨터 시계)"""
+        self.start_btn.config(state="disabled")
+
+        def worker() -> None:
+            offset = fetch_ntp_offset()
+
+            def apply() -> None:
+                if offset is not None:
+                    self.time_offset = offset
+                    self.synced = True
+                    src = "인터넷 표준시각"
+                else:
+                    src = "컴퓨터 시계(인터넷 안 됨)"
+                self._evaluate_expiry(src)
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _evaluate_expiry(self, source: str) -> None:
+        """현재 시각과 만료일을 비교해 만료 상태와 화면을 갱신한다."""
+        now = self.accurate_time()
+        if now >= EXPIRY_UNIX:
+            self._expired = True
+            self.start_btn.config(state="disabled")
+            self.expiry_label.config(
+                text=f"사용 기간이 만료되었습니다 (만료일 {EXPIRY_TEXT} KST)", foreground="#c0392b"
+            )
+            self.log(f"사용 기간 만료됨 — {source} 기준. (만료일 {EXPIRY_TEXT})")
+        else:
+            self._expired = False
+            days_left = (EXPIRY_UNIX - now) / 86400
+            self.expiry_label.config(
+                text=f"사용 가능 기간: ~{EXPIRY_TEXT} (KST) · 약 {days_left:.1f}일 남음",
+                foreground="#888",
+            )
+            if _PYAUTO_OK:
+                self.start_btn.config(state="normal")
 
     # ---------- 표준시각 ----------
     def accurate_time(self) -> float:
@@ -322,6 +374,11 @@ class MacroApp:
     # ---------- 실행 ----------
     def start(self) -> None:
         """입력값을 검증하고 매크로 스레드를 시작한다."""
+        # 실행 순간에도 만료를 한 번 더 확인 (인터넷 시간 기준)
+        self._evaluate_expiry("인터넷 표준시각" if self.synced else "컴퓨터 시계")
+        if self._expired:
+            messagebox.showwarning("사용 기간 만료", f"사용 기간이 만료되었습니다.\n만료일: {EXPIRY_TEXT} (KST)")
+            return
         if not self.windows:
             messagebox.showwarning("확인", "먼저 ① 에서 ＋창 추가로 창을 1개 이상 등록하세요.")
             return
