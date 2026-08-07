@@ -21,7 +21,7 @@ if errorlevel 1 (
 
 echo [1/3] 필요한 프로그램 설치 중... (처음 한 번만 오래 걸립니다)
 python -m pip install --upgrade pip >nul 2>&1
-python -m pip install pyautogui pyinstaller
+python -m pip install pyautogui pillow pyinstaller
 if errorlevel 1 (
     echo [오류] 설치에 실패했습니다. 인터넷 연결을 확인하세요.
     pause

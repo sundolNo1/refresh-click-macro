@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyautogui pyinstaller
+          pip install pyautogui pillow pyinstaller
 
       - name: Build exe
         run: pyinstaller --onefile --windowed --name "자동새로고침매크로" "매크로.py"

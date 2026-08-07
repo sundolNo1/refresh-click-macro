@@ -14,6 +14,7 @@ import os
 import platform
 import socket
 import struct
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -192,7 +193,52 @@ try:
 except Exception:  # pyautogui 미설치/환경 문제
     _PYAUTO_OK = False
 
+try:
+    from PIL import ImageChops, ImageStat
+    _PIL_OK = True
+except Exception:  # Pillow 미설치
+    _PIL_OK = False
+
 IS_MAC = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
+
+# ===== 보안문자 감시 =====
+# 감시 영역을 이 크기(흑백)로 줄여서 비교한다. 작을수록 빠르고 잔떨림에 둔감.
+WATCH_SIZE = (160, 120)
+WATCH_PERIOD = 0.4      # 감시 간격(초)
+WATCH_HITS = 2          # 이만큼 연속으로 달라져야 '떴다'고 판단 (깜빡임 오탐 방지)
+ALERT_BEEPS = 12        # 알림음 최대 반복 횟수
+ALERT_GAP = 1.2         # 알림음 간격(초)
+
+
+def grab_region(region: tuple[int, int, int, int]):
+    """화면의 지정 영역을 찍어 비교용 흑백 축소 이미지로 돌려준다."""
+    shot = pyautogui.screenshot(region=region)
+    return shot.convert("L").resize(WATCH_SIZE)
+
+
+def image_diff(a, b) -> float:
+    """두 비교용 이미지의 평균 밝기 차이를 0~100 으로 돌려준다."""
+    stat = ImageStat.Stat(ImageChops.difference(a, b))
+    return stat.mean[0] / 255.0 * 100.0
+
+
+def play_alert_sound() -> None:
+    """알림음을 한 번 낸다. (실패해도 조용히 넘어간다)"""
+    try:
+        if IS_MAC:
+            subprocess.Popen(
+                ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif IS_WINDOWS:
+            import winsound
+            winsound.Beep(1200, 300)
+            winsound.Beep(900, 300)
+        else:
+            print("\a", end="", flush=True)
+    except Exception:
+        pass
 
 # 새로고침 키 선택지 (표시 이름 → pyautogui 키 조합)
 KEY_CHOICES = {
@@ -216,6 +262,12 @@ class MacroApp:
         self.time_offset = 0.0   # 표준시각 - 내컴퓨터시각 (초)
         self.synced = False
         self._expired = False
+
+        # 보안문자 감시
+        self.watch_region: tuple[int, int, int, int] | None = None
+        self.watch_baseline = None          # 보안문자가 없을 때의 기준 화면
+        self._watch_ready = threading.Event()  # 새로고침/클릭 중에는 감시를 쉰다
+        self._alert_off = threading.Event()     # 알림음 중단 신호
 
         root.title("자동 새로고침 · 클릭 매크로")
         root.resizable(False, False)
@@ -292,9 +344,44 @@ class MacroApp:
             variable=self.align_var,
         ).grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
 
-        # 4. 시작 / 정지
+        # 4. 보안문자 감시 (뜨면 알려주기 — 입력은 직접)
+        frm_watch = ttk.LabelFrame(root, text="④ 보안문자 감시 (뜨면 알림 · 입력은 직접)")
+        frm_watch.grid(row=3, column=0, sticky="ew", **pad)
+
+        self.watch_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_watch, text="보안문자 입력란이 뜨면 소리로 알림", variable=self.watch_var,
+        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(8, 2), sticky="w")
+
+        ttk.Button(frm_watch, text="① 감시 영역 지정", command=self.capture_watch_region).grid(
+            row=1, column=0, padx=(10, 4), pady=4, sticky="ew"
+        )
+        ttk.Button(frm_watch, text="② 기준 화면 저장", command=self.capture_watch_baseline).grid(
+            row=1, column=1, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Label(frm_watch, text="민감도").grid(row=1, column=2, padx=(8, 2), sticky="e")
+        self.watch_sens_var = tk.StringVar(value="8")
+        ttk.Spinbox(
+            frm_watch, from_=1, to=60, increment=1, textvariable=self.watch_sens_var, width=5,
+        ).grid(row=1, column=3, padx=(0, 10), sticky="w")
+
+        self.watch_hint = ttk.Label(
+            frm_watch,
+            text="①영역: 보안문자가 나타나는 자리의 [왼쪽 위]→[오른쪽 아래] 모서리를 각 3초 안에 지정.\n"
+                 "②기준: 보안문자가 '없는' 평소 화면 상태에서 눌러 저장하세요.",
+            foreground="#555", wraplength=420, justify="left",
+        )
+        self.watch_hint.grid(row=2, column=0, columnspan=4, padx=10, pady=(2, 4), sticky="w")
+
+        self.watch_pause_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm_watch, text="알림이 울리면 매크로 자동 정지 (새로고침으로 화면이 사라지지 않게)",
+            variable=self.watch_pause_var,
+        ).grid(row=3, column=0, columnspan=4, padx=10, pady=(0, 8), sticky="w")
+
+        # 5. 시작 / 정지
         frm_run = ttk.Frame(root)
-        frm_run.grid(row=3, column=0, sticky="ew", **pad)
+        frm_run.grid(row=4, column=0, sticky="ew", **pad)
         self.start_btn = tk.Button(
             frm_run, text="▶ 시작", font=("", 15, "bold"), bg="#27ae60", fg="white",
             activebackground="#219150", width=10, command=self.start,
@@ -306,17 +393,17 @@ class MacroApp:
         )
         self.stop_btn.grid(row=0, column=1, padx=6, ipady=6)
 
-        # 5. 상태
+        # 6. 상태
         self.status = tk.Text(root, height=8, width=46, state="disabled", bg="#1e1e1e", fg="#dcdcdc")
-        self.status.grid(row=4, column=0, padx=14, pady=(4, 4))
+        self.status.grid(row=5, column=0, padx=14, pady=(4, 4))
         ttk.Label(
             root, text="정지: [정지] 버튼 · 또는 마우스를 화면 맨 왼쪽 위 모서리로",
             foreground="#555",
-        ).grid(row=5, column=0, pady=(0, 4))
+        ).grid(row=6, column=0, pady=(0, 4))
         self.expiry_label = ttk.Label(
             root, text=f"사용 가능 기간: ~{EXPIRY_TEXT} (KST) · 기간 확인 중…", foreground="#888"
         )
-        self.expiry_label.grid(row=6, column=0, pady=(0, 10))
+        self.expiry_label.grid(row=7, column=0, pady=(0, 10))
 
         if not _PYAUTO_OK:
             self.log("⚠ pyautogui 가 설치되지 않아 동작할 수 없습니다.")
@@ -325,6 +412,8 @@ class MacroApp:
         elif IS_MAC:
             self.log("맥 사용 시: 시스템 설정 > 개인정보 보호 및 보안 >")
             self.log("  '손쉬운 사용' 에 이 앱(또는 터미널)을 허용해야 합니다.")
+        if _PYAUTO_OK and not _PIL_OK:
+            self.log("⚠ Pillow 가 없어 보안문자 감시는 쓸 수 없습니다. (pip install pillow)")
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._tick()  # 실시간 시계 시작
@@ -523,6 +612,118 @@ class MacroApp:
         self._refresh_win_list()
         self.log("창 목록 모두 지움")
 
+    # ---------- 보안문자 감시 ----------
+    def capture_watch_region(self) -> None:
+        """[왼쪽 위]→[오른쪽 아래] 모서리를 3초씩 카운트다운하며 감시 영역으로 지정한다."""
+        if not _PYAUTO_OK:
+            return
+        corners: list[tuple[int, int]] = []
+        steps = [("① 왼쪽 위 모서리", "#e67e22"), ("② 오른쪽 아래 모서리", "#2980b9")]
+
+        def do_step(step: int, n: int) -> None:
+            name, color = steps[step]
+            if n > 0:
+                self.watch_hint.config(text=f"{name} 에 마우스를 올리세요…  {n}", foreground=color)
+                self.root.after(1000, do_step, step, n - 1)
+                return
+            x, y = pyautogui.position()
+            corners.append((int(x), int(y)))
+            if step + 1 < len(steps):
+                self.root.after(300, do_step, step + 1, 3)
+                return
+            (x1, y1), (x2, y2) = corners
+            left, top = min(x1, x2), min(y1, y2)
+            width, height = abs(x2 - x1), abs(y2 - y1)
+            if width < 10 or height < 10:
+                self.watch_hint.config(
+                    text="영역이 너무 좁습니다. 두 모서리를 더 넓게 잡아 다시 지정하세요.",
+                    foreground="#c0392b",
+                )
+                return
+            self.watch_region = (left, top, width, height)
+            self.watch_baseline = None
+            self.watch_hint.config(
+                text=f"감시 영역 지정됨 ({width}×{height}). 이제 보안문자가 없는 상태에서 "
+                     "[② 기준 화면 저장] 을 누르세요.",
+                foreground="#27ae60",
+            )
+            self.log(f"감시 영역: ({left}, {top}) 크기 {width}×{height}")
+
+        do_step(0, 3)
+
+    def capture_watch_baseline(self) -> None:
+        """지금 화면을 '보안문자가 없는 평소 상태' 기준으로 저장한다."""
+        if not _PYAUTO_OK or not _PIL_OK:
+            return
+        if self.watch_region is None:
+            self.watch_hint.config(text="먼저 [① 감시 영역 지정] 을 해주세요.", foreground="#c0392b")
+            return
+        try:
+            self.watch_baseline = grab_region(self.watch_region)
+        except Exception as exc:  # noqa: BLE001
+            self.watch_hint.config(text=f"기준 화면 저장 실패: {exc}", foreground="#c0392b")
+            return
+        self.watch_hint.config(
+            text="기준 화면 저장 완료. 이 화면과 달라지면 알림이 울립니다.", foreground="#27ae60"
+        )
+        self.log("보안문자 감시 기준 화면 저장됨")
+
+    def _watch_loop(self, region: tuple[int, int, int, int], baseline, threshold: float) -> None:
+        """감시 영역이 기준 화면과 달라지면 알린다. (매크로와 함께 도는 감시 스레드)"""
+        hits = 0
+        while not self._stop.is_set():
+            # 새로고침/클릭 동작 중에는 화면이 요동치므로 감시를 쉰다.
+            if not self._watch_ready.is_set():
+                if self._stop.wait(timeout=0.2):
+                    return
+                hits = 0
+                continue
+            try:
+                diff = image_diff(baseline, grab_region(region))
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"감시 중 오류: {exc}")
+                return
+            hits = hits + 1 if diff >= threshold else 0
+            if hits >= WATCH_HITS:
+                self.root.after(0, self._captcha_alert, diff)
+                return
+            if self._stop.wait(timeout=WATCH_PERIOD):
+                return
+
+    def _captcha_alert(self, diff: float) -> None:
+        """보안문자로 보이는 변화를 감지했을 때: 소리 + 창 띄우기 (+ 자동 정지)."""
+        self.log(f"⚠ 보안문자로 보이는 화면 변화 감지 (차이 {diff:.1f})")
+        if self.watch_pause_var.get() and not self._stop.is_set():
+            self._stop.set()
+            self.log("매크로 자동 정지 — 보안문자를 직접 입력하세요.")
+
+        # 창을 앞으로 끌어올려 눈에 띄게
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(3000, lambda: self.root.attributes("-topmost", False))
+        except Exception:
+            pass
+
+        # 알림음 반복 (정지 버튼을 누르거나 횟수를 다 채우면 멈춘다)
+        self._alert_off.clear()
+
+        def beeper() -> None:
+            for _ in range(ALERT_BEEPS):
+                if self._alert_off.is_set():
+                    return
+                play_alert_sound()
+                if self._alert_off.wait(timeout=ALERT_GAP):
+                    return
+
+        threading.Thread(target=beeper, daemon=True).start()
+        messagebox.showinfo(
+            "보안문자 확인",
+            "보안문자 입력란이 뜬 것 같습니다.\n브라우저 창에서 직접 입력해 주세요.",
+        )
+        self._alert_off.set()
+
     # ---------- 실행 ----------
     def start(self) -> None:
         """입력값을 검증하고 매크로 스레드를 시작한다."""
@@ -556,10 +757,33 @@ class MacroApp:
             )
             return
 
+        watch = self.watch_var.get()
+        if watch:
+            if not _PIL_OK:
+                messagebox.showwarning(
+                    "확인",
+                    "보안문자 감시에는 Pillow 가 필요합니다.\n터미널에서:  pip install pillow",
+                )
+                return
+            if self.watch_region is None or self.watch_baseline is None:
+                messagebox.showwarning(
+                    "확인",
+                    "④ 보안문자 감시를 켜려면\n"
+                    "[① 감시 영역 지정] 과 [② 기준 화면 저장] 을 먼저 해주세요.",
+                )
+                return
+            try:
+                threshold = float(self.watch_sens_var.get())
+            except ValueError:
+                messagebox.showwarning("확인", "감시 민감도는 숫자로 입력하세요. (기본 8)")
+                return
+
         keys = KEY_CHOICES[self.key_var.get()]
         clicks = 2 if self.click_mode_var.get() == "더블 클릭" else 1
         align = self.align_var.get()
         self._stop.clear()
+        self._alert_off.set()
+        self._watch_ready.clear()
         self._count = 0
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -572,6 +796,14 @@ class MacroApp:
             target=self._loop, args=(interval, wait, keys, clicks, align, windows), daemon=True
         )
         self._worker.start()
+
+        if watch:
+            self.log(f"보안문자 감시 켜짐 (민감도 {threshold:g})")
+            threading.Thread(
+                target=self._watch_loop,
+                args=(self.watch_region, self.watch_baseline, threshold),
+                daemon=True,
+            ).start()
 
     def _loop(
         self, interval: float, wait: float, keys: list[str], clicks: int, align: bool,
@@ -604,6 +836,7 @@ class MacroApp:
         try:
             while not self._stop.is_set():
                 self._count += 1
+                self._watch_ready.clear()  # 동작 중에는 화면이 요동치므로 감시를 잠시 멈춘다
 
                 # 새로고침 라운드: 각 창을 선택 → 새로고침 (빠르게 연속)
                 for focus, _target in windows:
@@ -625,6 +858,11 @@ class MacroApp:
                     pyautogui.click(x=target[0], y=target[1], clicks=clicks, interval=0.05)
                     time.sleep(gap)
                 self.log(f"[{self._count}] 창 {len(windows)}개 {mode} 완료")
+
+                # 화면이 안정될 시간을 준 뒤 감시 재개
+                if self._stop.wait(timeout=0.6):
+                    break
+                self._watch_ready.set()
 
                 if align:
                     # 다음 00초 격자까지 대기 (밀렸으면 그 다음 격자로 건너뛴다)
@@ -655,12 +893,15 @@ class MacroApp:
         self.stop_btn.config(state="disabled")
 
     def stop(self) -> None:
-        """매크로를 정지한다."""
+        """매크로를 정지한다. (울리고 있던 알림음도 끈다)"""
         self._stop.set()
+        self._alert_off.set()
+        self._watch_ready.clear()
         self.log("정지 요청됨.")
 
     def on_close(self) -> None:
         self._stop.set()
+        self._alert_off.set()
         self.root.destroy()
 
 
