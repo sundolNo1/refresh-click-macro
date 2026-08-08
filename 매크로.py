@@ -78,6 +78,18 @@ def align_grid(interval: float) -> float:
     return 60.0 / math.floor(60.0 / interval)
 
 
+# 격자보다 이만큼(초)까지 짧은 주기는 '일부러 앞당긴 값'으로 보고 그 차이를 유지한다.
+LEAD_MAX = 2.0
+
+
+def next_grid_target(now: float, grid: float, lead: float) -> float:
+    """now 이후에 오는 첫 발사 시각. 격자(00초)보다 lead 초 앞선 지점들이 대상이다.
+
+    grid=60, lead=0.15 이면 …:59.85 시각들 중 now 다음 것을 돌려준다.
+    """
+    return math.ceil((now + lead) / grid) * grid - lead
+
+
 def fetch_ntp_offset(timeout: float = 3.0) -> float | None:
     """NTP 서버에서 정확한 시각을 받아 (표준시각 - 내컴퓨터시각) 오차(초)를 반환.
 
@@ -270,7 +282,8 @@ class MacroApp:
         self._alert_off = threading.Event()     # 알림음 중단 신호
 
         root.title("자동 새로고침 · 클릭 매크로")
-        root.resizable(False, False)
+        # 크기 고정은 위젯을 다 만든 뒤(_fit_window)에 한다.
+        # 여기서 먼저 고정하면 내용 계산 전 크기에 묶여 아래·오른쪽이 잘린다.
 
         pad = {"padx": 14, "pady": 6}
 
@@ -340,7 +353,7 @@ class MacroApp:
         self.sync_label.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 4), sticky="w")
         self.align_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frm_time, text="표준시각 매분 00초에 맞춰 시작 (첫 새로고침을 00초에)",
+            frm_time, text="표준시각 00초에 맞추기 (예: 59.85 → 매분 59.85초)",
             variable=self.align_var,
         ).grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
 
@@ -348,25 +361,36 @@ class MacroApp:
         frm_watch = ttk.LabelFrame(root, text="④ 보안문자 감시 (뜨면 알림 · 입력은 직접)")
         frm_watch.grid(row=3, column=0, sticky="ew", **pad)
 
+        # 접기/펼치기 — 안 쓸 때는 접어서 창을 짧게 쓸 수 있다. (접어도 설정·동작은 그대로)
+        self.watch_open = True
+        self.watch_toggle = ttk.Button(
+            frm_watch, text="▼ 접기", width=9, command=self.toggle_watch,
+        )
+        self.watch_toggle.grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
+
+        body = ttk.Frame(frm_watch)
+        body.grid(row=1, column=0, sticky="ew")
+        self.watch_body = body
+
         self.watch_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frm_watch, text="보안문자 입력란이 뜨면 소리로 알림", variable=self.watch_var,
-        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(8, 2), sticky="w")
+            body, text="보안문자 입력란이 뜨면 소리로 알림", variable=self.watch_var,
+        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(2, 2), sticky="w")
 
-        ttk.Button(frm_watch, text="① 감시 영역 지정", command=self.capture_watch_region).grid(
+        ttk.Button(body, text="① 감시 영역 지정", command=self.capture_watch_region).grid(
             row=1, column=0, padx=(10, 4), pady=4, sticky="ew"
         )
-        ttk.Button(frm_watch, text="② 기준 화면 저장", command=self.capture_watch_baseline).grid(
+        ttk.Button(body, text="② 기준 화면 저장", command=self.capture_watch_baseline).grid(
             row=1, column=1, padx=4, pady=4, sticky="ew"
         )
-        ttk.Label(frm_watch, text="민감도").grid(row=1, column=2, padx=(8, 2), sticky="e")
+        ttk.Label(body, text="민감도").grid(row=1, column=2, padx=(8, 2), sticky="e")
         self.watch_sens_var = tk.StringVar(value="8")
         ttk.Spinbox(
-            frm_watch, from_=1, to=60, increment=1, textvariable=self.watch_sens_var, width=5,
+            body, from_=1, to=60, increment=1, textvariable=self.watch_sens_var, width=5,
         ).grid(row=1, column=3, padx=(0, 10), sticky="w")
 
         self.watch_hint = ttk.Label(
-            frm_watch,
+            body,
             text="①영역: 보안문자가 나타나는 자리의 [왼쪽 위]→[오른쪽 아래] 모서리를 각 3초 안에 지정.\n"
                  "②기준: 보안문자가 '없는' 평소 화면 상태에서 눌러 저장하세요.",
             foreground="#555", wraplength=420, justify="left",
@@ -375,7 +399,7 @@ class MacroApp:
 
         self.watch_pause_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            frm_watch, text="알림이 울리면 매크로 자동 정지 (새로고침으로 화면이 사라지지 않게)",
+            body, text="알림이 울리면 매크로 자동 정지 (새로고침으로 화면이 사라지지 않게)",
             variable=self.watch_pause_var,
         ).grid(row=3, column=0, columnspan=4, padx=10, pady=(0, 8), sticky="w")
 
@@ -415,10 +439,42 @@ class MacroApp:
         if _PYAUTO_OK and not _PIL_OK:
             self.log("⚠ Pillow 가 없어 보안문자 감시는 쓸 수 없습니다. (pip install pillow)")
 
+        # 모든 위젯을 올린 뒤 실제로 필요한 크기를 계산해 창을 그 크기로 맞춘다.
+        # (이 계산 전에 크기를 고정하면 아래쪽 ③④⑤ 영역이 잘려 보인다)
+        # 기본은 ④ 보안문자 감시를 접은 채로 시작한다. (필요할 때 펼쳐 쓰면 된다)
+        # toggle_watch() 안에서 _fit_window() 가 불려 창 크기도 함께 맞춰진다.
+        self.toggle_watch()
+
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._tick()  # 실시간 시계 시작
         self._startup_expiry_check()  # 사용 기한 확인 (인터넷 시간 기준)
         self._schedule_recheck()  # 켜 둔 채로 만료일이 지나가는 경우 대비
+
+    def toggle_watch(self) -> None:
+        """④ 보안문자 감시 영역을 접거나 편다. (설정값과 감시 동작에는 영향 없음)"""
+        if self.watch_open:
+            self.watch_body.grid_remove()
+            self.watch_toggle.config(text="▶ 펼치기")
+        else:
+            self.watch_body.grid()
+            self.watch_toggle.config(text="▼ 접기")
+        self.watch_open = not self.watch_open
+        self._fit_window()
+
+    def _fit_window(self) -> None:
+        """내용이 전부 보이도록 창 크기를 맞춘다. 화면보다 크면 화면 안으로 줄인다."""
+        root = self.root
+        # 이전에 걸어 둔 최소 크기·크기 고정을 먼저 풀어야 접었을 때 다시 줄어든다.
+        root.resizable(True, True)
+        root.minsize(1, 1)
+        root.update_idletasks()
+        w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+        max_h = max(400, root.winfo_screenheight() - 120)  # 메뉴막대·독 자리를 남긴다
+        h = min(h, max_h)
+        root.geometry(f"{w}x{h}")
+        root.minsize(w, h)
+        # 내용에 맞는 크기를 잡은 뒤에 고정한다 (기존과 같은 '크기 고정' 창).
+        root.resizable(False, h < root.winfo_reqheight())
 
     # ---------- 사용 기한 ----------
     def _startup_expiry_check(self) -> None:
@@ -819,15 +875,28 @@ class MacroApp:
         next_run = time.perf_counter()
         next_target = 0.0
         grid = interval
+        lead = 0.0
         if align:
-            # 새로고침이 항상 00초에 떨어지도록, 주기를 '00초 격자'에 맞춰 보정한다.
-            # 입력한 주기보다 빨라지지 않도록 항상 같거나 느린 쪽으로 맞춘다.
-            #   59.85초 → 60초 (매분 00초)      45초 → 60초 (매분 00초)
-            #   30초    → 30초 (00초·30초)      90초 → 120초 (2분마다 00초)
+            # 새로고침 간격은 '00초 격자'(60초·30초 …)에 맞춰 드리프트를 없애고,
+            # 입력한 주기가 격자보다 조금 짧으면 그 차이(lead)만큼 매번 앞당겨 누른다.
+            #   59.85초 → 60초 격자, 0.15초 먼저 = 매분 59.85초에 새로고침
+            #   30초    → 30초 격자, 앞당김 없음 = 00초·30초에 새로고침
+            #   45초    → 60초 격자, 차이가 커서 앞당김 없이 매분 00초에 새로고침
             grid = align_grid(interval)
-            if abs(grid - interval) > 1e-9:
-                self.log(f"정각 맞춤 — 주기를 {interval:.2f}초 → {grid:.2f}초 로 보정합니다.")
-            next_target = math.ceil(self.accurate_time() / grid) * grid
+            lead = grid - interval
+            if lead > LEAD_MAX:
+                self.log(
+                    f"정각 맞춤 — 주기를 {interval:.2f}초 → {grid:.2f}초 로 보정해 00초에 맞춥니다."
+                )
+                lead = 0.0
+            elif lead > 1e-9:
+                self.log(
+                    f"정각 맞춤 — {grid:.2f}초 간격으로, 00초보다 {lead:.2f}초 먼저"
+                    f"(매 {interval:.2f}초 지점) 새로고침합니다."
+                )
+            else:
+                self.log(f"정각 맞춤 — {grid:.2f}초 간격으로 00초에 새로고침합니다.")
+            next_target = next_grid_target(self.accurate_time(), grid, lead)
             delay = next_target - self.accurate_time()
             self.log(f"표준시각 {self._fmt_kst(next_target)} 에 첫 새로고침 예정 ({delay:.2f}초 대기)")
             if self._stop.wait(timeout=max(0.0, delay)):
@@ -865,11 +934,11 @@ class MacroApp:
                 self._watch_ready.set()
 
                 if align:
-                    # 다음 00초 격자까지 대기 (밀렸으면 그 다음 격자로 건너뛴다)
+                    # 다음 발사 지점까지 대기 (밀렸으면 그 다음 지점으로 건너뛴다)
                     next_target += grid
                     now = self.accurate_time()
                     if next_target < now:
-                        next_target = math.ceil(now / grid) * grid
+                        next_target = next_grid_target(now, grid, lead)
                     delay = next_target - now
                     if self._stop.wait(timeout=max(0.0, delay)):
                         break
