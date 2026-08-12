@@ -25,9 +25,9 @@ from tkinter import messagebox, ttk
 KST_OFFSET = 9 * 3600
 
 # ===== 사용 기한 =====
-# 2026년 8월 22일 00시 00분 (KST) 이 되면 만료.
-EXPIRY_TEXT = "2026-08-22 00:00"
-EXPIRY_UNIX = calendar.timegm((2026, 8, 22, 0, 0, 0)) - KST_OFFSET
+# 2026년 10월 30일 00시 00분 (KST) 이 되면 만료.
+EXPIRY_TEXT = "2026-10-30 00:00"
+EXPIRY_UNIX = calendar.timegm((2026, 10, 30, 0, 0, 0)) - KST_OFFSET
 # NTP 시간 서버 목록 (앞에서부터 시도)
 NTP_SERVERS = ("time.google.com", "time.windows.com", "kr.pool.ntp.org", "pool.ntp.org")
 # NTP(UDP 123)가 막힌 환경을 위한 예비 수단: HTTPS 응답의 Date 헤더
