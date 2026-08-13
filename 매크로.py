@@ -40,6 +40,11 @@ STATE_FILENAME = "state.dat"
 # 저장된 시각보다 이만큼 넘게 과거로 돌아가면 시계 조작으로 본다.
 ROLLBACK_TOLERANCE = 300.0  # 초
 
+APP_TITLE = "자동 새로고침 · 클릭 매크로"
+# ⑥ 상태창 줄 수. 화면이 낮으면 _fit_window() 가 MIN 까지 자동으로 줄인다.
+STATUS_ROWS = 8
+STATUS_ROWS_MIN = 4
+
 
 def parse_seconds(text: str) -> float:
     """시간 입력을 초(float)로 변환한다.
@@ -281,7 +286,7 @@ class MacroApp:
         self._watch_ready = threading.Event()  # 새로고침/클릭 중에는 감시를 쉰다
         self._alert_off = threading.Event()     # 알림음 중단 신호
 
-        root.title("자동 새로고침 · 클릭 매크로")
+        root.title(APP_TITLE)
         # 크기 고정은 위젯을 다 만든 뒤(_fit_window)에 한다.
         # 여기서 먼저 고정하면 내용 계산 전 크기에 묶여 아래·오른쪽이 잘린다.
 
@@ -418,7 +423,9 @@ class MacroApp:
         self.stop_btn.grid(row=0, column=1, padx=6, ipady=6)
 
         # 6. 상태
-        self.status = tk.Text(root, height=8, width=46, state="disabled", bg="#1e1e1e", fg="#dcdcdc")
+        self.status = tk.Text(
+            root, height=STATUS_ROWS, width=46, state="disabled", bg="#1e1e1e", fg="#dcdcdc"
+        )
         self.status.grid(row=5, column=0, padx=14, pady=(4, 4))
         ttk.Label(
             root, text="정지: [정지] 버튼 · 또는 마우스를 화면 맨 왼쪽 위 모서리로",
@@ -467,10 +474,30 @@ class MacroApp:
         # 이전에 걸어 둔 최소 크기·크기 고정을 먼저 풀어야 접었을 때 다시 줄어든다.
         root.resizable(True, True)
         root.minsize(1, 1)
+        # 상태창은 늘 기본 줄 수에서 시작한다. (접었다 펴며 줄었던 것을 되돌린다)
+        self.status.config(height=STATUS_ROWS)
         root.update_idletasks()
+
+        # 화면이 낮아 다 안 들어가면 ⑥ 상태창 줄 수부터 줄인다.
+        # (그냥 잘라 내면 맨 아래 '사용 가능 기간' 줄이 화면 밖으로 밀린다)
+        # 쓸 수 있는 높이는 화면 높이에서 빼는 식으로는 알 수 없다.
+        # (맥은 독·메뉴막대, 윈도우는 작업 표시줄만큼 창을 알아서 깎는다)
+        # 그래서 원하는 크기를 한 번 요청해 보고 실제로 받은 높이를 기준으로 삼는다.
+        rows = STATUS_ROWS
+        for _ in range(STATUS_ROWS - STATUS_ROWS_MIN + 1):
+            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+            root.geometry(f"{w}x{h}")
+            root.update()
+            got = root.winfo_height()
+            if got >= h or got < 100 or rows <= STATUS_ROWS_MIN:
+                break  # 다 들어갔다 (또는 더 줄일 수 없다 / 아직 창이 안 떴다)
+            rows -= 1
+            self.status.config(height=rows)
+            root.update_idletasks()
+
         w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-        max_h = max(400, root.winfo_screenheight() - 120)  # 메뉴막대·독 자리를 남긴다
-        h = min(h, max_h)
+        if root.winfo_height() > 100:
+            h = min(h, root.winfo_height())
         root.geometry(f"{w}x{h}")
         root.minsize(w, h)
         # 내용에 맞는 크기를 잡은 뒤에 고정한다 (기존과 같은 '크기 고정' 창).
@@ -512,11 +539,20 @@ class MacroApp:
             self.root.after(600_000, again)
         self.root.after(600_000, again)
 
+    def _show_expiry(self, text: str, color: str) -> None:
+        """기간 안내를 맨 아래 줄과 제목 표시줄에 함께 쓴다.
+
+        화면이 낮은 컴퓨터에서는 맨 아래 줄이 창 밖으로 밀릴 수 있어서,
+        제목 표시줄에도 같은 내용을 남겨 둔다. (제목은 창 크기에 영향 없음)
+        """
+        self.expiry_label.config(text=text, foreground=color)
+        self.root.title(f"{APP_TITLE} — {text}")
+
     def _block(self, reason: str) -> None:
         """실행을 막고, 돌고 있으면 정지시킨 뒤 사유를 화면에 표시한다."""
         self._expired = True
         self.start_btn.config(state="disabled")
-        self.expiry_label.config(text=reason, foreground="#c0392b")
+        self._show_expiry(reason, "#c0392b")
         if not self._stop.is_set():
             self._stop.set()
 
@@ -550,9 +586,8 @@ class MacroApp:
         save_state({"max_seen": max(now, max_seen), "expired": False})
         self._expired = False
         days_left = (EXPIRY_UNIX - now) / 86400
-        self.expiry_label.config(
-            text=f"사용 가능 기간: ~{EXPIRY_TEXT} (KST) · 약 {days_left:.1f}일 남음",
-            foreground="#888",
+        self._show_expiry(
+            f"사용 가능 기간: ~{EXPIRY_TEXT} (KST) · 약 {days_left:.1f}일 남음", "#888"
         )
         if _PYAUTO_OK:
             self.start_btn.config(state="normal")
