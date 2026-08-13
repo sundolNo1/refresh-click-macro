@@ -5,7 +5,72 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
+  # 릴리스 자산을 덮어쓰면 GitHub 다운로드 카운터가 0으로 초기화된다.
+  # 재빌드가 시작되는 시점(= 수동 덮어쓰기 직전)의 카운트를 파일로 남겨 누적치를 보존한다.
+  record-downloads:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record current release download counts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LOG=릴리스_다운로드_기록.tsv
+          [ -f "$LOG" ] || printf '기록시각\t태그\t자산명\t자산ID\t다운로드수\n' > "$LOG"
+
+          # 릴리스가 아직 없으면 조용히 넘어간다.
+          rows=$(gh api repos/${{ github.repository }}/releases \
+            --jq '.[] | .tag_name as $t | .assets[] | [$t, .name, (.id|tostring), (.download_count|tostring)] | @tsv' \
+            2>/dev/null || true)
+          if [ -z "$rows" ]; then
+            echo "기록할 릴리스 자산이 없습니다."
+            exit 0
+          fi
+
+          now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          added=0
+          while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            # 같은 자산ID·다운로드수가 이미 마지막으로 기록돼 있으면 중복 기록하지 않는다.
+            id=$(printf '%s' "$row" | cut -f3)
+            cnt=$(printf '%s' "$row" | cut -f4)
+            last=$(awk -F'\t' -v id="$id" '$4 == id { v = $5 } END { print v }' "$LOG")
+            if [ "$last" = "$cnt" ]; then
+              continue
+            fi
+            printf '%s\t%s\n' "$now" "$row" >> "$LOG"
+            added=$((added + 1))
+          done <<< "$rows"
+
+          {
+            echo "### 재빌드 전 릴리스 다운로드 수"
+            echo ''
+            echo '| 태그 | 자산 | 다운로드 |'
+            echo '| --- | --- | --- |'
+            printf '%s\n' "$rows" | awk -F'\t' '{ printf "| %s | %s | %s |\n", $1, $2, $4 }'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$added" -eq 0 ]; then
+            echo "변동 없음 — 커밋 생략."
+            exit 0
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add "$LOG"
+          git commit -m "재빌드 전 릴리스 다운로드 수 기록 ($now)"
+          # 동시 실행 시 밀릴 수 있어 rebase 후 재시도한다.
+          for i in 1 2 3; do
+            git push && exit 0
+            git pull --rebase --autostash
+          done
+          exit 1
+
   build:
     runs-on: windows-latest
     steps:
