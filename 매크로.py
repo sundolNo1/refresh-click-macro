@@ -354,7 +354,8 @@ class MacroApp:
         ttk.Button(frm_time, text="표준시각 동기화", command=self.sync_time).grid(
             row=0, column=1, padx=10, pady=8
         )
-        self.sync_label = ttk.Label(frm_time, text="동기화 안 됨 (인터넷 연결 필요)", foreground="#c0392b")
+        # 시작하자마자 _startup_expiry_check() 가 확인하므로 '확인 중' 으로 시작한다.
+        self.sync_label = ttk.Label(frm_time, text="표준시각 확인 중… 잠시만요", foreground="#e67e22")
         self.sync_label.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 4), sticky="w")
         self.align_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -518,6 +519,7 @@ class MacroApp:
             offset = fetch_trusted_offset()
 
             def apply() -> None:
+                self._show_sync(offset)  # ③ 줄도 같이 갱신 (버튼을 안 눌러도)
                 if offset is None:
                     self.synced = False
                     self._block("인터넷 연결이 필요합니다 (시각 확인 실패)")
@@ -538,6 +540,22 @@ class MacroApp:
             self._verify_expiry_async()
             self.root.after(600_000, again)
         self.root.after(600_000, again)
+
+    def _show_sync(self, offset: float | None) -> None:
+        """③ 표준시각 줄을 갱신한다.
+
+        시작할 때 자동으로 하는 확인과 [표준시각 동기화] 버튼이 모두 이리로 온다.
+        (예전에는 버튼을 눌렀을 때만 갱신돼서, 자동 확인이 성공했는데도
+         '동기화 안 됨' 이 빨간 글씨로 남아 있었다)
+        """
+        if offset is None:
+            self.sync_label.config(
+                text="동기화 실패 — 인터넷 연결을 확인하세요", foreground="#c0392b"
+            )
+        else:
+            self.sync_label.config(
+                text=f"동기화 완료 · 내 시계와 오차 {offset:+.3f}초", foreground="#27ae60"
+            )
 
     def _show_expiry(self, text: str, color: str) -> None:
         """기간 안내를 맨 아래 줄과 제목 표시줄에 함께 쓴다.
@@ -616,19 +634,14 @@ class MacroApp:
             offset = fetch_trusted_offset()
 
             def apply() -> None:
+                self._show_sync(offset)
                 if offset is None:
                     self.synced = False
-                    self.sync_label.config(
-                        text="동기화 실패 — 인터넷 연결을 확인하세요", foreground="#c0392b"
-                    )
                     self.log("표준시각 동기화 실패 — 인터넷 연결을 확인하세요.")
                     self._block("인터넷 연결이 필요합니다 (시각 확인 실패)")
                 else:
                     self.time_offset = offset
                     self.synced = True
-                    self.sync_label.config(
-                        text=f"동기화 완료 · 내 시계와 오차 {offset:+.3f}초", foreground="#27ae60"
-                    )
                     self.log(f"표준시각 동기화 완료 (오차 {offset:+.3f}초)")
                     self._evaluate_expiry()
             self.root.after(0, apply)
